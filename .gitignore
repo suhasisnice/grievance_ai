@@ -1,0 +1,16 @@
+# Secrets — API keys live here, must never be committed
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Test scratch files
+ai_service/tests/holdout_results/_partial.json
+
+# OS junk
+.DS_Store
+Thumbs.db
