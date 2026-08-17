@@ -6,6 +6,11 @@ Public functions (this is the contract the backend team imports and calls):
     normalize_text(text) -> {"canonical_text": str, "language": str}
     describe_image(file_path) -> str
     classify_complaint(text, image_description=None) -> dict
+    classify_from_raw_input(text, image_description=None) -> dict
+        Preferred entry point for RAW (untranslated) complaint text: decides
+        for itself whether normalize_text() is needed (native Indic script)
+        or should be skipped (English/Hinglish), then classifies. Use this
+        instead of calling normalize_text() + classify_complaint() by hand.
     embed_text(text) -> {"vector": [768 floats]}
 
 Reliability rules (must hold for every function):
@@ -186,6 +191,48 @@ def _describe_image_with_gemini(client: genai.Client, file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# script detection (for classify_from_raw_input)
+# ---------------------------------------------------------------------------
+
+# Unicode blocks for the native scripts normalize_text() should run on. These
+# ranges are contiguous (Devanagari through Malayalam sit back-to-back from
+# U+0900), so this table also acts as one effective "native Indic script"
+# range for the yes/no question.
+_INDIC_SCRIPT_RANGES = [
+    ("devanagari", 0x0900, 0x097F),  # Hindi, Marathi, etc.
+    ("bengali", 0x0980, 0x09FF),
+    ("gurmukhi", 0x0A00, 0x0A7F),  # Punjabi
+    ("gujarati", 0x0A80, 0x0AFF),
+    ("odia", 0x0B00, 0x0B7F),
+    ("tamil", 0x0B80, 0x0BFF),
+    ("telugu", 0x0C00, 0x0C7F),
+    ("kannada", 0x0C80, 0x0CFF),
+    ("malayalam", 0x0D00, 0x0D7F),
+]
+
+
+def _detect_native_script(text: str) -> Optional[str]:
+    """Pure local check, no API call. Scans left to right and returns on the
+    FIRST native-script character found — a single native character anywhere
+    in the text (e.g. one Devanagari word dropped into an otherwise-English
+    sentence) is enough to report that script, and classify_from_raw_input()
+    will send the WHOLE string to normalize_text() on that basis. That's the
+    intended behavior for code-mixed input: we don't try to split the string
+    script-by-script, we just ask "does this need translation at all?"
+
+    Returns None only when no character in `text` falls in a native-script
+    range — i.e. the text is Latin-script only (English or Hinglish). That's
+    also the worst case for runtime: every character gets checked against all
+    9 ranges, which is fine at complaint length."""
+    for ch in text:
+        codepoint = ord(ch)
+        for name, start, end in _INDIC_SCRIPT_RANGES:
+            if start <= codepoint <= end:
+                return name
+    return None
+
+
+# ---------------------------------------------------------------------------
 # classify_complaint
 # ---------------------------------------------------------------------------
 
@@ -298,6 +345,64 @@ def _validate_classification(parsed: dict, source: str) -> dict:
         "summary": parsed.get("summary") or "No summary available.",
         "source": source,
     }
+
+
+# ---------------------------------------------------------------------------
+# classify_from_raw_input
+# ---------------------------------------------------------------------------
+
+def classify_from_raw_input(text: str, image_description: Optional[str] = None) -> dict:
+    """The actual production entry point: takes RAW complaint text and decides
+    for itself whether translation is needed. Runs normalize_text() first only
+    when `text` contains native Indic script (Devanagari/Bengali/Gurmukhi/
+    Gujarati/Odia/Tamil/Telugu/Kannada/Malayalam, via _detect_native_script());
+    Latin-script text (English or Hinglish) goes straight to
+    classify_complaint(), skipping translation entirely.
+
+    Why conditional: holdout evidence (tests/holdout_results/holdout_normalized.json)
+    shows translation is net-negative on Latin-script input specifically. Of
+    the 2 failures in the --normalize run (vs 0 on raw text), only case 10
+    (Hinglish) was a translation problem — normalize_text() dropped "dirty
+    water entering the shops, no customers coming", which lost the detail
+    that pushed priority from high down to medium. Case 26 (Devanagari)
+    translated faithfully ("Street sweepers do not come on time and only do
+    a formality") and the model still miscategorised it as garbage instead of
+    sanitation — a classifier boundary problem, not a translation problem.
+    Conditional normalization fixes the first failure mode but not the
+    second, since case 26 is native script and will still be translated
+    here. Expect this path to score ~29/30 on the current holdout, not 30/30.
+
+    Returns the same dict shape as classify_complaint(), plus:
+        normalized (bool):          whether normalize_text() actually ran AND
+                                     succeeded (False if skipped as
+                                     Latin-script, and also False if it ran
+                                     but fell back internally)
+        detected_script (str|None): which native script triggered translation,
+                                     if any
+
+    Never raises. If normalize_text() falls back internally (its own
+    fallback=True), this falls back right along with it and classifies the
+    original raw text rather than giving up.
+    """
+    detected_script = _detect_native_script(text)
+    canonical_text = text
+    normalized = False
+
+    if detected_script is not None:
+        result = normalize_text(text)
+        if result.get("fallback"):
+            logger.warning(
+                "classify_from_raw_input: normalize_text fell back for detected "
+                "script '%s', classifying raw text instead", detected_script,
+            )
+        else:
+            canonical_text = result.get("canonical_text") or text
+            normalized = True
+
+    classification = classify_complaint(canonical_text, image_description)
+    classification["normalized"] = normalized
+    classification["detected_script"] = detected_script
+    return classification
 
 
 # ---------------------------------------------------------------------------
