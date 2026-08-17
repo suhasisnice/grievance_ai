@@ -8,22 +8,26 @@ This is the real accuracy number. run_examples.py grades the model on the same
 scores 15/15. This scores it on 30 complaints it has never seen.
 
 Options:
-    --normalize     Run the full production path (normalize_text -> classify)
-                    instead of classifying the raw text directly. Doubles the
-                    API calls and therefore the runtime. See "WHICH PATH AM I
-                    TESTING?" below.
+    --normalize        Always run normalize_text() first, then classify.
+                        Doubles the API calls and therefore the runtime.
+                        See "WHICH PATH AM I TESTING?" below.
+    --smart-normalize   Run classify_from_raw_input(): normalize_text() only
+                        runs when native Indic script is detected, Latin-script
+                        text (English/Hinglish) classifies directly. This is
+                        the actual current production entry point.
     --start N       Skip the first N cases (for resuming a chunked run)
     --limit N       Only run N cases
     --delay N       Seconds between API calls (default 15, for free-tier limits)
 
 WHICH PATH AM I TESTING?
     By default this calls classify_complaint(raw_text) directly, which is what
-    run_examples.py does. But production actually runs normalize_text() first
-    to translate regional-language input to English, THEN classifies. For the
-    Kannada/Tamil/Telugu/Hindi cases in the holdout set those are meaningfully
-    different tests. Run both and compare — if --normalize scores better, the
-    translation step is earning its API call; if it scores worse, it's losing
-    detail in translation and worth a look.
+    run_examples.py does. --normalize always translates first — for the
+    Kannada/Tamil/Telugu/Hindi cases in the holdout set that's a meaningfully
+    different test. --smart-normalize translates conditionally, matching what
+    classify_from_raw_input() actually does in production. Run all three and
+    compare: if --normalize scores worse than raw, translation is losing
+    detail somewhere; --smart-normalize shows whether skipping translation for
+    already-Latin text recovers that loss.
 
 READING THE OUTPUT:
     The headline number is EXACT MATCH (category AND priority both right).
@@ -41,8 +45,19 @@ import time
 from collections import Counter, defaultdict
 
 from ai_service.categories import HUMAN_REVIEW_CONFIDENCE_THRESHOLD
-from ai_service.service import classify_complaint, normalize_text
+from ai_service.service import (
+    _detect_native_script,
+    classify_complaint,
+    classify_from_raw_input,
+    normalize_text,
+)
 from ai_service.tests.holdout_set import HOLDOUT_SET
+
+MODE_LABELS = {
+    "raw": "classify on raw text",
+    "normalize": "normalize -> classify (always translate)",
+    "smart": "classify_from_raw_input (smart: translate only if native script)",
+}
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "holdout_results")
 
@@ -60,18 +75,35 @@ def _truncate(text: str, length: int = 60) -> str:
     return text if len(text) <= length else text[: length - 1] + "…"
 
 
-def run_case(case: dict, use_normalize: bool) -> dict:
-    """Classifies one holdout case and grades it. Never raises — a case that
-    blows up is recorded as an error row rather than killing the whole run,
-    because a 25-minute run dying on case 28 is miserable."""
+def run_case(case: dict, mode: str) -> dict:
+    """Classifies one holdout case under the given mode and grades it. Never
+    raises — a case that blows up is recorded as an error row rather than
+    killing the whole run, because a 25-minute run dying on case 28 is
+    miserable.
+
+    mode:
+        "raw"       -- classify_complaint(text) directly, no translation
+        "normalize" -- normalize_text() then classify_complaint(), always
+                       translates regardless of script
+        "smart"     -- classify_from_raw_input(), translates only when
+                       _detect_native_script() finds native Indic script
+    """
     text = case["text"]
     language = None
+    detected_script = None
+    took_translation_path = None
     try:
-        if use_normalize:
+        if mode == "normalize":
             normalized = normalize_text(text)
             text = normalized.get("canonical_text") or text
             language = normalized.get("language")
-        result = classify_complaint(text)
+            result = classify_complaint(text)
+        elif mode == "smart":
+            result = classify_from_raw_input(text)
+            detected_script = result.get("detected_script")
+            took_translation_path = detected_script is not None
+        else:
+            result = classify_complaint(text)
     except Exception as exc:  # noqa: BLE001 — a scorer must never crash mid-run
         return {
             "text": case["text"],
@@ -86,8 +118,10 @@ def run_case(case: dict, use_normalize: bool) -> dict:
 
     return {
         "text": case["text"],
-        "normalized_text": text if use_normalize else None,
+        "normalized_text": text if mode == "normalize" else None,
         "detected_language": language,
+        "detected_script": detected_script,
+        "took_translation_path": took_translation_path,
         "expected_category": case["expected_category"],
         "expected_priority": case["expected_priority"],
         "got_category": got_category,
@@ -104,7 +138,7 @@ def run_case(case: dict, use_normalize: bool) -> dict:
     }
 
 
-def report(rows: list, use_normalize: bool) -> dict:
+def report(rows: list, mode: str) -> dict:
     """Prints the scorecard and returns the summary dict that gets saved."""
     errors = [r for r in rows if r.get("source") == "error"]
     fallbacks = [r for r in rows if r.get("source") == "fallback"]
@@ -114,13 +148,13 @@ def report(rows: list, use_normalize: bool) -> dict:
     scored = [r for r in rows if r.get("source") in ("gemini", "groq")]
 
     print("\n" + "=" * 78)
-    print(f"HOLDOUT SCORECARD  ({'normalize -> classify' if use_normalize else 'classify on raw text'})")
+    print(f"HOLDOUT SCORECARD  ({MODE_LABELS[mode]})")
     print("=" * 78)
 
     if not scored:
         print("\nNothing was scored — every call fell back or errored.")
         print("Check your API key and rate limits, then re-run.")
-        return {"scored": 0, "errors": len(errors), "fallbacks": len(fallbacks)}
+        return {"scored": 0, "errors": len(errors), "fallbacks": len(fallbacks), "mode": mode}
 
     n = len(scored)
     cat_hits = sum(1 for r in scored if r["category_ok"])
@@ -139,6 +173,20 @@ def report(rows: list, use_normalize: bool) -> dict:
         strict_exact = sum(1 for r in strict if r["exact_ok"])
         print(f"\n  Excluding the {len(scored) - len(strict)} borderline cases:"
               f"   {strict_exact}/{len(strict)}   {strict_exact / len(strict):6.1%}")
+
+    translated_count = direct_count = None
+    if mode == "smart":
+        translated = [r for r in scored if r.get("took_translation_path")]
+        direct = [r for r in scored if not r.get("took_translation_path")]
+        translated_count, direct_count = len(translated), len(direct)
+        print("\n" + "-" * 78)
+        print("TRANSLATION PATH SPLIT")
+        print("-" * 78)
+        print(f"  translated (native script detected)   {translated_count:>3}/{n}")
+        print(f"  direct (Latin script, skipped)         {direct_count:>3}/{n}")
+        scripts = Counter(r["detected_script"] for r in translated)
+        if scripts:
+            print("  scripts seen: " + ", ".join(f"{name} x{count}" for name, count in scripts.most_common()))
 
     # ---- where it went wrong -------------------------------------------
     cat_misses = [r for r in scored if not r["category_ok"]]
@@ -209,6 +257,9 @@ def report(rows: list, use_normalize: bool) -> dict:
                   f"    conf {r['confidence']:.2f}  via {r['source']}")
             if r.get("normalized_text"):
                 print(f"    normalized: {_truncate(r['normalized_text'], 66)}")
+            if mode == "smart":
+                path = f"translated (script: {r['detected_script']})" if r.get("took_translation_path") else "direct (Latin script, no translation)"
+                print(f"    path: {path}")
             if r.get("note"):
                 print(f"    label reason: {r['note']}")
 
@@ -236,7 +287,10 @@ def report(rows: list, use_normalize: bool) -> dict:
         "mean_confidence_wrong": (sum(r["confidence"] for r in wrong) / len(wrong)) if wrong else None,
         "confidently_wrong": len(escaped),
         "provider_mix": dict(sources),
-        "used_normalize": use_normalize,
+        "mode": mode,
+        "used_normalize": mode == "normalize",
+        "translated_count": translated_count,
+        "direct_count": direct_count,
     }
 
 
@@ -249,23 +303,43 @@ def _severity(priority: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Score the classifier against the held-out set.")
-    parser.add_argument("--normalize", action="store_true",
-                        help="run normalize_text() first (the real production path)")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--normalize", action="store_true",
+                        help="run normalize_text() first for every case (always translates)")
+    mode_group.add_argument("--smart-normalize", action="store_true",
+                        help="run classify_from_raw_input() (translates only when native script is detected)")
     parser.add_argument("--start", type=int, default=0, help="skip the first N cases")
     parser.add_argument("--limit", type=int, default=None, help="only run N cases")
     parser.add_argument("--delay", type=float, default=15.0,
                         help="seconds between calls (default 15 for free-tier limits)")
     args = parser.parse_args()
 
+    if args.smart_normalize:
+        mode = "smart"
+    elif args.normalize:
+        mode = "normalize"
+    else:
+        mode = "raw"
+
     cases = HOLDOUT_SET[args.start:]
     if args.limit:
         cases = cases[: args.limit]
 
-    calls_per_case = 2 if args.normalize else 1
-    est_minutes = (len(cases) * args.delay * calls_per_case) / 60
-    print(f"\nRunning {len(cases)} holdout cases"
-          f" ({'normalize -> classify' if args.normalize else 'classify only'}),"
-          f" {args.delay:g}s between calls.")
+    # In smart mode, only cases with native script make a second (translate)
+    # API call — precompute which ones so the runtime estimate and the
+    # inter-call delay both reflect the real number of calls, not a worst
+    # case of "every case translates".
+    will_translate = [_detect_native_script(c["text"]) is not None for c in cases] if mode == "smart" else None
+
+    if mode == "normalize":
+        total_calls = len(cases) * 2
+    elif mode == "smart":
+        total_calls = sum(2 if t else 1 for t in will_translate)
+    else:
+        total_calls = len(cases)
+    est_minutes = (total_calls * args.delay) / 60
+    print(f"\nRunning {len(cases)} holdout cases ({MODE_LABELS[mode]}),"
+          f" {args.delay:g}s between calls ({total_calls} calls total).")
     print(f"Estimated runtime: ~{est_minutes:.0f} minutes. Progress prints as it goes.\n")
 
     rows = []
@@ -275,10 +349,10 @@ def main():
     for i, case in enumerate(cases):
         if i > 0:
             time.sleep(args.delay)
-        if args.normalize and i > 0:
-            time.sleep(args.delay)  # second call for this case needs its own slot
+        if i > 0 and (mode == "normalize" or (mode == "smart" and will_translate[i])):
+            time.sleep(args.delay)  # this case makes a second API call, give it its own slot
 
-        row = run_case(case, args.normalize)
+        row = run_case(case, mode)
         rows.append(row)
 
         # Save after every case — a 25-minute run should never lose its work
@@ -299,9 +373,9 @@ def main():
         print(f"  [{args.start + i + 1:>2}/{args.start + len(cases)}] {mark:<2} "
               f"{_truncate(case['text'], 56)}")
 
-    summary = report(rows, args.normalize)
+    summary = report(rows, mode)
 
-    suffix = "normalized" if args.normalize else "raw"
+    suffix = {"raw": "raw", "normalize": "normalized", "smart": "smart"}[mode]
     out_path = os.path.join(RESULTS_DIR, f"holdout_{suffix}.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump({"summary": summary, "rows": rows}, fh, ensure_ascii=False, indent=2)
