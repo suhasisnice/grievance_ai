@@ -1,0 +1,8 @@
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+Backend/venv
+Backend/uploads
+.git
+ai_service/tests/holdout_results
